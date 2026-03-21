@@ -4,12 +4,49 @@ Steam Input Controller Patch for InControl Games - GUI
 """
 
 import subprocess
+import tempfile
+import plistlib
 from pathlib import Path
-from tkinter import Tk, Label, Button, Frame, Listbox, filedialog, messagebox, SINGLE
-from tkinter.font import Font
+from tkinter import Tk, Frame, PhotoImage, filedialog, messagebox
+from tkinter import ttk
 from typing import Optional
 
 from patch import DLL_RELATIVE_PATH, find_installed_games, patch_dll, restore_dll
+
+
+def get_app_icon(app_path: Path, size: int = 32) -> Optional[PhotoImage]:
+    """Extract app icon from .app bundle and return as PhotoImage."""
+    try:
+        # Find icon file from Info.plist
+        info_plist = app_path / "Contents" / "Info.plist"
+        if info_plist.exists():
+            with open(info_plist, "rb") as f:
+                plist = plistlib.load(f)
+            icon_name = plist.get("CFBundleIconFile", "")
+            if not icon_name.endswith(".icns"):
+                icon_name += ".icns"
+            icns_path = app_path / "Contents" / "Resources" / icon_name
+        else:
+            # Fallback: find any .icns file
+            icns_files = list((app_path / "Contents" / "Resources").glob("*.icns"))
+            icns_path = icns_files[0] if icns_files else None
+
+        if not icns_path or not icns_path.exists():
+            return None
+
+        # Convert .icns to PNG using sips (macOS built-in)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        subprocess.run(
+            ["sips", "-s", "format", "png", "-z", str(size), str(size),
+             str(icns_path), "--out", tmp_path],
+            capture_output=True, check=True
+        )
+
+        return PhotoImage(file=tmp_path)
+    except Exception:
+        return None
 
 
 def get_app_path(dll_path: Path) -> Optional[Path]:
@@ -36,82 +73,98 @@ def codesign_app(app_path: Path) -> bool:
 class PatcherApp:
     def __init__(self):
         self.root = Tk()
-        self.root.title("Steam Input Controller Patch for InControl Games")
+        self.root.title("Steam Input Patch")
         self.root.resizable(False, False)
 
         self.dll_path: Optional[Path] = None
         self.installed_games: list[tuple[str, Path]] = []
+        self.icons: list[PhotoImage] = []  # Keep references to prevent garbage collection
+
         self.setup_ui()
         self.detect_games()
 
     def setup_ui(self):
         self.root.configure(padx=20, pady=20)
 
-        title_font = Font(size=14, weight="bold")
-        Label(self.root, text="Steam Input Patch", font=title_font).pack()
-        Label(self.root, text="for InControl Games").pack()
+        # Configure treeview style for taller rows
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=40, font=("Helvetica Neue", 12))
 
-        Frame(self.root, height=10).pack()
+        # Title
+        ttk.Label(self.root, text="Steam Input Patch", font=("Helvetica Neue", 16, "bold")).pack()
+        ttk.Label(self.root, text="for InControl Games", foreground="gray").pack()
 
-        Label(self.root, text="Select a game:", fg="gray").pack(anchor="w")
+        ttk.Frame(self.root, height=10).pack()
 
-        self.game_frame = Frame(self.root)
+        ttk.Label(self.root, text="Select a game:", foreground="gray").pack(anchor="w")
+
+        self.game_frame = ttk.Frame(self.root)
         self.game_frame.pack(pady=5, fill="x")
 
-        self.game_list = Listbox(
-            self.game_frame, selectmode=SINGLE, width=35, height=6,
-            exportselection=False
+        # Treeview with icon and name columns
+        self.game_tree = ttk.Treeview(
+            self.game_frame, columns=("name",), show="tree",
+            height=5, selectmode="browse"
         )
-        self.game_list.pack(fill="x")
-        self.game_list.bind("<<ListboxSelect>>", self._on_game_selected)
+        self.game_tree.column("#0", width=50, stretch=False)  # Icon column
+        self.game_tree.column("name", width=260)
+        self.game_tree.pack(fill="x")
+        self.game_tree.bind("<<TreeviewSelect>>", self._on_game_selected)
 
-        self.status = Label(self.root, text="No game selected", fg="gray")
+        self.status = ttk.Label(self.root, text="No game selected", foreground="gray")
         self.status.pack(pady=10)
 
-        self.path_label = Label(self.root, text="", fg="gray", wraplength=300, justify="center")
+        self.path_label = ttk.Label(self.root, text="", foreground="gray", wraplength=300, justify="center")
         self.path_label.pack()
 
-        Frame(self.root, height=10).pack()
+        ttk.Frame(self.root, height=10).pack()
 
-        btn_frame = Frame(self.root)
+        btn_frame = ttk.Frame(self.root)
         btn_frame.pack(pady=10)
 
-        self.patch_btn = Button(btn_frame, text="Patch", width=10, command=self.do_patch, state="disabled")
+        self.patch_btn = ttk.Button(btn_frame, text="Patch", width=10, command=self.do_patch, state="disabled")
         self.patch_btn.pack(side="left", padx=5)
 
-        self.restore_btn = Button(btn_frame, text="Restore", width=10, command=self.do_restore, state="disabled")
+        self.restore_btn = ttk.Button(btn_frame, text="Restore", width=10, command=self.do_restore, state="disabled")
         self.restore_btn.pack(side="left", padx=5)
 
-        self.codesign_btn = Button(btn_frame, text="Codesign", width=10, command=self.do_codesign, state="disabled")
+        self.codesign_btn = ttk.Button(btn_frame, text="Codesign", width=10, command=self.do_codesign, state="disabled")
         self.codesign_btn.pack(side="left", padx=5)
 
     def detect_games(self):
         self.installed_games = find_installed_games()
 
-        # Populate list with found games
-        for name, _ in self.installed_games:
-            self.game_list.insert("end", name)
+        # Populate tree with found games
+        for i, (name, dll_path) in enumerate(self.installed_games):
+            app_path = get_app_path(dll_path)
+            icon = get_app_icon(app_path) if app_path else None
+            if icon:
+                self.icons.append(icon)
+                self.game_tree.insert("", "end", iid=str(i), image=icon, values=(name,))
+            else:
+                self.game_tree.insert("", "end", iid=str(i), text="", values=(name,))
 
         # Add option to browse for custom game
-        self.game_list.insert("end", "── Select other app... ──")
+        self.game_tree.insert("", "end", iid="browse", text=" 🔍", values=("Select other app...",))
 
         if len(self.installed_games) == 0:
-            self.status.config(text="No games found", fg="gray")
+            self.status.config(text="No games found", foreground="gray")
         else:
-            self.status.config(text=f"Found {len(self.installed_games)} game(s)")
+            self.status.config(text=f"Found {len(self.installed_games)} game(s)", foreground="gray")
 
     def _on_game_selected(self, _event=None):
-        selection = self.game_list.curselection()
+        selection = self.game_tree.selection()
         if not selection:
             return
-        idx = selection[0]
+        item_id = selection[0]
 
-        # Last item is "Select other app..."
-        if idx >= len(self.installed_games):
-            self.game_list.selection_clear(0, "end")
+        # "browse" item is for selecting other app
+        if item_id == "browse":
+            self.game_tree.selection_remove("browse")
             self.browse()
             return
 
+        idx = int(item_id)
         name, dll_path = self.installed_games[idx]
         self.set_dll(dll_path, name)
 
@@ -122,16 +175,23 @@ class PatcherApp:
             initialdir=Path.home()
         )
         if app_path:
-            dll_path = Path(app_path) / DLL_RELATIVE_PATH
+            app_path = Path(app_path)
+            dll_path = app_path / DLL_RELATIVE_PATH
             if dll_path.exists():
-                name = Path(app_path).stem
-                # Add to list before the "Select other" option
+                name = app_path.stem
                 idx = len(self.installed_games)
                 self.installed_games.append((name, dll_path))
-                self.game_list.insert(idx, name)
+
+                # Add to tree before "browse" item
+                icon = get_app_icon(app_path)
+                if icon:
+                    self.icons.append(icon)
+                    self.game_tree.insert("", idx, iid=str(idx), image=icon, values=(name,))
+                else:
+                    self.game_tree.insert("", idx, iid=str(idx), text="", values=(name,))
+
                 # Select it
-                self.game_list.selection_clear(0, "end")
-                self.game_list.selection_set(idx)
+                self.game_tree.selection_set(str(idx))
                 self.set_dll(dll_path, name)
             else:
                 messagebox.showerror("Error", "Assembly-CSharp.dll not found in selected app")
@@ -144,34 +204,34 @@ class PatcherApp:
 
         backup = path.with_suffix(".dll.bak")
         if backup.exists():
-            self.status.config(text=f"{game_name} (backup exists)" if game_name else "Ready (backup exists)", fg="green")
+            self.status.config(text=f"{game_name} (backup exists)" if game_name else "Ready (backup exists)", foreground="green")
             self.restore_btn.config(state="normal")
         else:
-            self.status.config(text=game_name or "Ready", fg="green")
+            self.status.config(text=game_name or "Ready", foreground="green")
             self.restore_btn.config(state="disabled")
 
     def do_patch(self):
         if not self.dll_path:
             return
         if patch_dll(self.dll_path):
-            self.status.config(text="Patched!", fg="green")
+            self.status.config(text="Patched!", foreground="green")
             self.restore_btn.config(state="normal")
             messagebox.showinfo(
                 "Success",
                 "Patch applied!\n\nNow enable Steam Input:\nSteam -> Game -> Properties -> Controller"
             )
         else:
-            self.status.config(text="Patch failed", fg="red")
+            self.status.config(text="Patch failed", foreground="red")
             messagebox.showerror("Error", "Patch failed - strings not found or already patched")
 
     def do_restore(self):
         if not self.dll_path:
             return
         if restore_dll(self.dll_path):
-            self.status.config(text="Restored", fg="green")
+            self.status.config(text="Restored", foreground="green")
             messagebox.showinfo("Success", "Restored from backup!")
         else:
-            self.status.config(text="Restore failed", fg="red")
+            self.status.config(text="Restore failed", foreground="red")
             messagebox.showerror("Error", "No backup found")
 
     def do_codesign(self):
@@ -182,10 +242,10 @@ class PatcherApp:
             messagebox.showerror("Error", "Could not find .app bundle")
             return
         if codesign_app(app_path):
-            self.status.config(text="Codesigned!", fg="green")
+            self.status.config(text="Codesigned!", foreground="green")
             messagebox.showinfo("Success", f"App signed:\n{app_path.name}")
         else:
-            self.status.config(text="Codesign failed", fg="red")
+            self.status.config(text="Codesign failed", foreground="red")
             messagebox.showerror("Error", "Codesign failed")
 
     def run(self):
